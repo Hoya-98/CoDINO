@@ -13,6 +13,7 @@ import torchvision.ops as ops
 import numpy as np
 import re
 import timm
+import pandas as pd
 
 from src.model import VisualBackbone
 from src.utils import (
@@ -37,10 +38,9 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 def process_example(
-    idx, img_filename, entry, model, transform, map_keys, img_dir, density_map_dir, config, return_maps=False
+    idx, img_filename, entry, model, transform, map_keys, img_dir, config, return_maps=False
 ):
     img = Image.open(os.path.join(img_dir, img_filename)).convert('RGB')
-    density_map = np.load(os.path.join(density_map_dir, f"{img_filename.split('.')[0]}.npy"))
     w, h = img.size    
 
     with torch.no_grad():
@@ -57,7 +57,7 @@ def process_example(
     if config.num_exemplars is not None:
         assert config.num_exemplars > 0, "num_exemplars must be greater than 0. config.num_exemplars = " + config.num_exemplars
         ex_bboxes = ex_bboxes[:config.num_exemplars]
-    bboxes = np.array([(x1 / w, y1 / h, x2 / w, y2 / h) for x1, y1, x2, y2 in ex_bboxes]) * feats.shape[-1]
+    bboxes = np.array([(x1 / w, y1 / h, x2 / h, y2 / h) for x1, y1, x2, y2 in ex_bboxes]) * feats.shape[-1]
     bboxes = bboxes_tointeger(bboxes, config.remove_bbox_intersection)
 
     conv_maps = []
@@ -146,158 +146,164 @@ def process_example(
         conv_maps, pooled_features_list, rescaled_bboxes, output_sizes, config
     )
     if return_maps:
-        return density_map, output
-    return density_map.sum().item(), output.sum().item()
+        return None, output
+    return None, output.sum().item()
 
 
-def post_process_density_map(conv_maps, pooled_feats, bboxes, output_sizes, config):
+def post_process_density_map(conv_maps, pooled_features_list, rescaled_bboxes, output_sizes, config):
+    if config.exemplar_avg:
+        output = conv_maps[0]
+    else:
+        # Resize all conv_maps to the same size
+        output, resize_ratios = resize_conv_maps(conv_maps)
+        output = output.mean(dim=0)
+
+        if config.use_roi_norm and config.roi_norm_after_mean:
+            if config.cosine_similarity:
+                output += 1.0
+            pooled_vals = []
+            for bbox, ratio in zip(rescaled_bboxes, resize_ratios):
+                scaled_bbox = torch.tensor([
+                    bbox[0] * ratio[1], bbox[1] * ratio[0],
+                    bbox[2] * ratio[1], bbox[3] * ratio[0]
+                ]).int()
+                output_size = (
+                    int(scaled_bbox[3] - scaled_bbox[1]),
+                    int(scaled_bbox[2] - scaled_bbox[0])
+                )
+                pooled = ops.roi_align(
+                    output.unsqueeze(0).unsqueeze(0),
+                    [scaled_bbox.unsqueeze(0).float().to(device)],
+                    output_size=output_size, spatial_scale=1.0
+                )
+                pooled_vals.append(pooled)
+
+            if config.ellipse_normalization:
+                norm_coeff = sum([(p[0, 0] * ellipse_coverage(p.shape[-2], p.shape[-1]).to(device)).sum() for p in pooled_vals]) / (len(pooled_vals) * config.scaling_coeff)
+            else:
+                norm_coeff = sum([p.sum() for p in pooled_vals]) / (len(pooled_vals) * config.scaling_coeff)
+            if config.fixed_norm_coeff is not None:
+                norm_coeff = config.fixed_norm_coeff
+
+            output = output / norm_coeff
+
+    if config.use_minmax_norm:
+        output = (output - output.min()) / (output.max() - output.min())
+
     if config.use_threshold:
-        output, resize_ratios = resize_conv_maps(conv_maps)
-        output = output.mean(dim=0)
-        if config.use_minmax_norm:
-            output = rescale_tensor(output)
+        output = (output > config.threshold).float()
 
-        thresh = torch.median(output)
-        output[output < thresh] = 0
-        return output
+    if config.filter_background:
+        output = filter_background(output, pooled_features_list, config)
 
-    if config.use_roi_norm and config.roi_norm_after_mean:
-        output, resize_ratios = resize_conv_maps(conv_maps)
-        output = output.mean(dim=0)
-        if config.use_minmax_norm:
-            output = rescale_tensor(output)
-
-        pooled_vals = []
-        for bbox, ratio in zip(bboxes, resize_ratios):
-            scaled_bbox = torch.tensor([
-                bbox[0] * ratio[1], bbox[1] * ratio[0],
-                bbox[2] * ratio[1], bbox[3] * ratio[0]
-            ]).int()
-            # scaled_bbox = torch.tensor(bboxes_tointeger(scaled_bbox.unsqueeze(0), config.remove_bbox_intersection)[0])
-            output_size = (
-                int(scaled_bbox[3] - scaled_bbox[1]),
-                int(scaled_bbox[2] - scaled_bbox[0])
-            )
-            pooled = ops.roi_align(
-                output.unsqueeze(0).unsqueeze(0),
-                [scaled_bbox.unsqueeze(0).float().to(device)],
-                output_size=output_size, spatial_scale=1.0
-            )
-            pooled_vals.append(pooled)
-
-        if config.ellipse_normalization:
-            norm_coeff = sum([(p[0, 0] * ellipse_coverage(p.shape[-2], p.shape[-1]).to(device)).sum() for p in pooled_vals]) / (len(pooled_vals) * config.scaling_coeff)
-        else:
-            norm_coeff = sum([p.sum() for p in pooled_vals]) / (len(pooled_vals) * config.scaling_coeff)
-        if config.fixed_norm_coeff is not None:
-            norm_coeff = config.fixed_norm_coeff
-
-        output = output / norm_coeff
-        if config.filter_background is True:
-            thresh = max( [f.shape[-2] * f.shape[-1] for f in pooled_feats] )
-            thresh = (1 / thresh ) * 1.0
-            output[output < thresh] = 0
+    if config.ellipse_normalization:
+        output = ellipse_normalization(output)
 
     return output
 
 
+def filter_background(density_map, pooled_features_list, config):
+    """Filter out background noise from the density map."""
+    if not pooled_features_list:
+        return density_map
+        
+    # Calculate threshold based on the size of the largest exemplar
+    max_size = max([f.shape[-2] * f.shape[-1] for f in pooled_features_list])
+    threshold = (1.0 / max_size) * config.scaling_coeff
+    
+    # Apply threshold
+    density_map[density_map < threshold] = 0
+    
+    return density_map
+
+
+def ellipse_normalization(density_map):
+    """Apply ellipse normalization to the density map."""
+    h, w = density_map.shape[-2:]
+    ellipse = ellipse_coverage(h, w).to(device)
+    return density_map * ellipse
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name', type=str, default='dinov2_vitb14_reg')
-    parser.add_argument('--img_dir', type=str, default='/raid/datasets/FSC147/images_384_VarV2')
-    parser.add_argument('--density_map_dir', type=str, default='/raid/datasets/FSC147/gt_density_map_adaptive_384_VarV2')
-    parser.add_argument('--annotation', type=str, default='annotations/annotation_FSC147_384.json')
-    parser.add_argument('--splits', type=str, default='annotations/Train_Test_Val_FSC_147.json')
-    parser.add_argument('--log_file', type=str, default='results/results.csv')
-    
-    parser.add_argument('--divide_et_impera', type=str2bool, default=False)
-    parser.add_argument('--divide_et_impera_twice', type=str2bool, default=False)
-    parser.add_argument('--exemplar_avg', type=str2bool, default=False)
-    parser.add_argument('--cosine_similarity', type=str2bool, default=False)
-    parser.add_argument('--normalize_features', type=str2bool, default=False)
-    parser.add_argument('--normalize_only_biggest_bbox', type=str2bool, default=False)
-    parser.add_argument('--use_threshold', type=str2bool, default=False)
-    parser.add_argument('--use_roi_norm', type=str2bool, default=True)
-    parser.add_argument('--roi_norm_after_mean', type=str2bool, default=True)
-    parser.add_argument('--use_minmax_norm', type=str2bool, default=True)
-    parser.add_argument('--remove_bbox_intersection', type=str2bool, default=False)
-    parser.add_argument('--correct_bbox_resize', type=str2bool, default=True)
-    parser.add_argument('--scaling_coeff', type=float, default=1.0)
-    parser.add_argument('--fixed_norm_coeff', type=float, default=None)
-    parser.add_argument('--filter_background', type=str2bool, default=False)
-    parser.add_argument('--ellipse_normalization', type=str2bool, default=False)
-    parser.add_argument('--ellipse_kernel_cleaning', type=str2bool, default=False)
-    parser.add_argument('--split', type=str, default='test')
-    parser.add_argument('--num_exemplars', type=int, default=None)
-
-    parser.add_argument('--save_preds_to_file', type=str2bool, default=False)
-    parser.add_argument('--log_results', type=str2bool, default=True)
-    parser.add_argument('--no_skip', type=str2bool, default=False)
-# CUDA_VISIBLE_DEVICES=4 python convolutional_counting.py --model_name dino_resnet50 --divide_et_impera True --divide_et_impera_twice True --filter_background False --ellipse_normalization True --ellipse_kernel_cleaning True --split test
-    # 
+    parser.add_argument("--model_name", type=str, default="dinov2_vits14_reg")
+    parser.add_argument("--img_dir", type=str, required=True)
+    parser.add_argument("--annotation", type=str, required=True)
+    parser.add_argument("--splits", type=str, required=True)
+    parser.add_argument("--log_file", type=str, default="results.csv")
+    parser.add_argument("--divide_et_impera", action="store_true")
+    parser.add_argument("--divide_et_impera_twice", action="store_true")
+    parser.add_argument("--exemplar_avg", action="store_true")
+    parser.add_argument("--cosine_similarity", action="store_true")
+    parser.add_argument("--normalize_features", action="store_true")
+    parser.add_argument("--normalize_only_biggest_bbox", action="store_true")
+    parser.add_argument("--use_threshold", action="store_true")
+    parser.add_argument("--use_roi_norm", action="store_true")
+    parser.add_argument("--roi_norm_after_mean", action="store_true")
+    parser.add_argument("--use_minmax_norm", action="store_true")
+    parser.add_argument("--remove_bbox_intersection", action="store_true")
+    parser.add_argument("--correct_bbox_resize", action="store_true")
+    parser.add_argument("--scaling_coeff", type=float, default=1.0)
+    parser.add_argument("--fixed_norm_coeff", type=float, default=None)
+    parser.add_argument("--filter_background", action="store_true")
+    parser.add_argument("--ellipse_normalization", action="store_true")
+    parser.add_argument("--ellipse_kernel_cleaning", action="store_true")
+    parser.add_argument("--split", type=str, default="test")
+    parser.add_argument("--num_exemplars", type=int, default=None)
+    parser.add_argument("--save_preds_to_file", action="store_true")
+    parser.add_argument("--log_results", action="store_true")
+    parser.add_argument("--no_skip", action="store_true")
+    parser.add_argument("--resize_dim", type=int, default=840)
     args = parser.parse_args()
 
-    save_preds_to_file = args.save_preds_to_file
-
-    row_params_dict = {k: v for k, v in vars(args).items() if k not in ['img_dir', 'density_map_dir', 'annotation', 'splits', 'log_file']}
-    args_dict = {k: v for k, v in vars(args).items() if k not in ['model_name', 'img_dir', 'density_map_dir', 'annotation', 'splits', 'save_preds_to_file', 'log_results', 'no_skip', 'log_file']}
-    if exist_match_df(args.log_file, row_params_dict) and not args.no_skip:
-        #print("Already done for this configuration. Skipping...")
-        return
-    else:
-        # create dummy row
-        dummy_idx = add_dummy_row(args.model_name, args_dict, args.log_file)
-        
-    
     print("Parameters Recap:")
-    print(json.dumps(vars(args), indent=4))
-    
+    print(json.dumps(vars(args), indent=2))
 
-    if 'mae' in args.model_name or 'clip' in args.model_name or 'sam' in args.model_name:
-        match = re.search(r'patch(\d+)', args.model_name)
-        patch_size = int(match.group(1))
-        resize_dim = patch_size * 60
-        model = VisualBackbone(args.model_name, img_size=resize_dim).to(device).eval()
-        data_config = timm.data.resolve_model_data_config(model)
-        data_config['input_size'] = (3, resize_dim, resize_dim)
-        transform = timm.data.create_transform(**data_config, is_training=False)
-    else:
-        resize_dim = 840 if 'dinov2' in args.model_name else 480
-        model = VisualBackbone(args.model_name, img_size=resize_dim).to(device).eval()
-        transform = T.Compose([
-            T.Resize((resize_dim, resize_dim), interpolation=T.InterpolationMode.BICUBIC),
-            T.ToTensor(),
-            T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-        ])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    examples = load_json(args.annotation)
-    splits = load_json(args.splits)
-    examples = {k: v for k, v in examples.items() if k in splits[args.split]}
+    # Load model
+    model = VisualBackbone(args.model_name, img_size=args.resize_dim).to(device).eval()
+    transform = T.Compose([
+        T.Resize((args.resize_dim, args.resize_dim)),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
-    map_keys = ['vit_out'] if 'vit' in args.model_name else ['map3']
+    # Load annotations
+    with open(args.annotation, 'r') as f:
+        annotations = json.load(f)
+    with open(args.splits, 'r') as f:
+        splits = json.load(f)
 
-    predictions, targets = [], []
+    # Get image filenames for the specified split
+    img_filenames = splits[args.split]
 
-    for idx, (img_filename, entry) in tqdm(enumerate(examples.items()), total=len(examples)):
-        gt, pred = process_example(idx, img_filename, entry, model, transform, map_keys,
-                                   args.img_dir, args.density_map_dir, args)
-        predictions.append(pred)
-        targets.append(gt)
+    # Initialize results
+    results = []
+    map_keys = ['vit_out']  # Changed from ['layer11'] to ['vit_out'] for DINOv2
+
+    # Process each image
+    for idx, img_filename in enumerate(tqdm(img_filenames)):
+        # Get annotation for this image
+        if img_filename not in annotations:
+            print(f"Warning: No annotation found for {img_filename}")
+            continue
+
+        entry = {
+            'filename': img_filename,
+            'box_examples_coordinates': annotations[img_filename]['box_examples_coordinates']
+        }
         
-    if save_preds_to_file:
-        save_dir = os.path.join('results', args.model_name)
-        os.makedirs(save_dir, exist_ok=True)
-        # out file name must be specific to the configuration
-        out_file_name = f"predictions_{args.model_name}_{'_'.join([f'{k}_{v}' for k, v in args_dict.items()])}.npy"
-        np.save(os.path.join(save_dir, out_file_name), predictions)
-        #np.save(os.path.join(save_dir, 'targets.npy'), targets)
-    metrics = get_counting_metrics(predictions, targets)
-    print(metrics)
+        # Process the image
+        _, pred = process_example(idx, img_filename, entry, model, transform, map_keys, args.img_dir, args)
+        results.append(pred)
 
+    # Save results
     if args.log_results:
-        # Logging the results
-        exist_and_delete_match_df(args.log_file, row_params_dict)
-        log_results({**args_dict, **metrics}, args.model_name, path=args.log_file)
-        
-if __name__ == '__main__':
+        os.makedirs(os.path.dirname(args.log_file), exist_ok=True)
+        with open(args.log_file, 'w') as f:
+            json.dump(results, f, indent=2)
+
+if __name__ == "__main__":
     main()

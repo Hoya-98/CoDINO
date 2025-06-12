@@ -1,0 +1,13 @@
+CUDA_VISIBLE_DEVICES="" python convolutional_counting.py \
+  --model_name dinov2_vits14_reg \
+  --img_dir data/screws/images \
+  --annotation data/screws/annotations/annotation.json \
+  --splits data/screws/annotations/test_split.json \
+  --divide_et_impera \
+  --divide_et_impera_twice \
+  --filter_background \
+  --ellipse_normalization \
+  --ellipse_kernel_cleaning \
+  --split test \
+  --log_file results/screws_results.csv \
+  --resize_dim 840

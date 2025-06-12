@@ -92,20 +92,23 @@ def draw_bounding_boxes(input_image, bounding_boxes, captions=[""], color="red",
 
 def convert_4corners_to_x1y1x2y2(bbox):
     """
-    Convert a bounding box from four-corner format to (x1, y1, x2, y2) format.
+    Convert a bounding box from [x1, y1, x2, y2] format to (x1, y1, x2, y2) format.
     
     Args:
-        box (list): A list of four [x, y] points in the format 
-                    [[x_min, y_min], [x_min, y_max], [x_max, y_max], [x_max, y_min]]
+        bbox (list): A list of four coordinates [x1, y1, x2, y2]
 
     Returns:
         tuple: (x1, y1, x2, y2) where 
                x1, y1 = top-left corner
                x2, y2 = bottom-right corner
     """
+    # If the input is already in the correct format, just return it
+    if len(bbox) == 4:
+        return bbox[0], bbox[1], bbox[2], bbox[3]
+    
+    # If the input is in the old format [[x1, y1], [x2, y2]]
     x1, y1 = bbox[0]  # Top-left corner
     x2, y2 = bbox[2]  # Bottom-right corner
-
     return x1, y1, x2, y2
 
 def process_bboxes(imgs, bboxes, transform):
