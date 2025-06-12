@@ -1,0 +1,138 @@
+{
+  "model_name": "dinov2_vits14_reg",
+  "dataset": "screws",
+  "split": "test",
+  "total_images": 1,
+  "final_metrics": {
+    "mae": 15.34524154663086,
+    "mse": 235.47643812444585,
+    "rmse": 15.34524154663086
+  },
+  "parameters": {
+    "model_name": "dinov2_vits14_reg",
+    "custom_weights": "dinov2_vits14_merged.pth",
+    "img_dir": "data/screws/images",
+    "annotation": "data/screws/annotations/annotation.json",
+    "splits": "data/screws/annotations/test_split.json",
+    "divide_et_impera": true,
+    "divide_et_impera_twice": true,
+    "exemplar_avg": false,
+    "cosine_similarity": false,
+    "normalize_features": false,
+    "normalize_only_biggest_bbox": false,
+    "use_threshold": false,
+    "use_roi_norm": false,
+    "roi_norm_after_mean": false,
+    "use_minmax_norm": false,
+    "remove_bbox_intersection": false,
+    "correct_bbox_resize": false,
+    "scaling_coeff": 1.0,
+    "fixed_norm_coeff": null,
+    "filter_background": true,
+    "ellipse_normalization": true,
+    "ellipse_kernel_cleaning": true,
+    "split": "test",
+    "num_exemplars": 1,
+    "save_preds_to_file": false,
+    "log_results": false,
+    "no_skip": false,
+    "resize_dim": 840,
+    "log_file": "results/results.json",
+    "experiment_name": null
+  },
+  "results": [
+    {
+      "filename": "screws_335.png",
+      "predicted_count": 29.34524154663086,
+      "ground_truth": 14,
+      "mae": 15.34524154663086,
+      "mse": 235.47643812444585,
+      "exemplar_boxes": [
+        [
+          481.525,
+          654.413,
+          714.953,
+          870.168
+        ],
+        [
+          1013.99,
+          667.444,
+          1239.408,
+          897.0039999999999
+        ],
+        [
+          606.044,
+          1646.78,
+          774.728,
+          1824.03
+        ],
+        [
+          493.242,
+          918.87,
+          800.984,
+          1024.124
+        ],
+        [
+          901.719,
+          953.29,
+          1192.652,
+          1054.29
+        ],
+        [
+          752.069,
+          512.494,
+          919.069,
+          691.494
+        ],
+        [
+          705.304,
+          1343.9,
+          792.304,
+          1433.3376
+        ],
+        [
+          594.753,
+          272.064,
+          1301.7530000000002,
+          383.064
+        ],
+        [
+          1224.15,
+          629.986,
+          2184.733,
+          746.62
+        ],
+        [
+          117.404,
+          1137.41,
+          1074.589,
+          1246.41
+        ],
+        [
+          789.892,
+          1153.03,
+          1093.967,
+          1254.03
+        ],
+        [
+          380.777,
+          1165.64,
+          467.777,
+          1259.1817
+        ],
+        [
+          928.713,
+          1452.03,
+          1633.961,
+          1568.793
+        ],
+        [
+          145.725,
+          336.342,
+          437.879,
+          438.59999999999997
+        ]
+      ]
+    }
+  ]
+}

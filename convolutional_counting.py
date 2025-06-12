@@ -6,33 +6,21 @@ from tqdm import tqdm
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.transforms as T
 import torchvision.ops as ops
 
 import numpy as np
-import re
-import timm
-import pandas as pd
 import math
 from datetime import datetime
 
 from src.model import VisualBackbone
 from src.utils import (
     convert_4corners_to_x1y1x2y2, 
-    get_counting_metrics, 
-    log_results,
-    add_dummy_row,
-    exist_match_df,
-    exist_and_delete_match_df,
-    load_json, 
     get_features, 
     bboxes_tointeger, 
     compute_avg_conv_filter, 
     rescale_tensor,
     resize_conv_maps,
     rescale_bbox,
-    str2bool,
     ellipse_coverage
 )
 
@@ -62,7 +50,7 @@ def process_example(
     if config.num_exemplars is not None:
         assert config.num_exemplars > 0, "num_exemplars must be greater than 0. config.num_exemplars = " + config.num_exemplars
         ex_bboxes = ex_bboxes[:config.num_exemplars]
-    bboxes = np.array([(x1 / w, y1 / h, x2 / h, y2 / h) for x1, y1, x2, y2 in ex_bboxes]) * feats.shape[-1]
+    bboxes = np.array([(x1 / w, y1 / h, x2 / w, y2 / h) for x1, y1, x2, y2 in ex_bboxes]) * feats.shape[-1]
     bboxes = bboxes_tointeger(bboxes, config.remove_bbox_intersection)
 
     conv_maps = []
@@ -151,61 +139,58 @@ def process_example(
         conv_maps, pooled_features_list, rescaled_bboxes, output_sizes, config
     )
     if return_maps:
-        return None, output
-    return None, output.sum().item()
+        return output
+    return  output.sum().item()
 
 
-def post_process_density_map(conv_maps, pooled_features_list, rescaled_bboxes, output_sizes, config):
-    if config.exemplar_avg:
-        output = conv_maps[0]
-    else:
-        # Resize all conv_maps to the same size
+def post_process_density_map(conv_maps, pooled_feats, bboxes, output_sizes, config):
+    if config.use_threshold:
         output, resize_ratios = resize_conv_maps(conv_maps)
         output = output.mean(dim=0)
+        if config.use_minmax_norm:
+            output = rescale_tensor(output)
 
-        if config.use_roi_norm and config.roi_norm_after_mean:
-            if config.cosine_similarity:
-                output += 1.0
-            pooled_vals = []
-            for bbox, ratio in zip(rescaled_bboxes, resize_ratios):
-                scaled_bbox = torch.tensor([
-                    bbox[0] * ratio[1], bbox[1] * ratio[0],
-                    bbox[2] * ratio[1], bbox[3] * ratio[0]
-                ]).int()
-                output_size = (
-                    int(scaled_bbox[3] - scaled_bbox[1]),
-                    int(scaled_bbox[2] - scaled_bbox[0])
-                )
-                pooled = ops.roi_align(
-                    output.unsqueeze(0).unsqueeze(0),
-                    [scaled_bbox.unsqueeze(0).float().to(device)],
-                    output_size=output_size, spatial_scale=1.0
-                )
-                pooled_vals.append(pooled)
+        thresh = torch.median(output)
+        output[output < thresh] = 0
+        return output
 
-            if config.ellipse_normalization:
-                norm_coeff = sum([(p[0, 0] * ellipse_coverage(p.shape[-2], p.shape[-1]).to(device)).sum() for p in pooled_vals]) / (len(pooled_vals) * config.scaling_coeff)
-            else:
-                norm_coeff = sum([p.sum() for p in pooled_vals]) / (len(pooled_vals) * config.scaling_coeff)
-            if config.fixed_norm_coeff is not None:
-                norm_coeff = config.fixed_norm_coeff
-
-            output = output / norm_coeff
-
+    # if config.use_roi_norm and config.roi_norm_after_mean:
+    output, resize_ratios = resize_conv_maps(conv_maps)
+    output = output.mean(dim=0)
     if config.use_minmax_norm:
-        output = (output - output.min()) / (output.max() - output.min())
+        output = rescale_tensor(output)
 
-    if config.use_threshold:
-        output = (output > config.threshold).float()
-
-    if config.filter_background:
-        output = filter_background(output, pooled_features_list, config)
+    pooled_vals = []
+    for bbox, ratio in zip(bboxes, resize_ratios):
+        scaled_bbox = torch.tensor([
+            bbox[0] * ratio[1], bbox[1] * ratio[0],
+            bbox[2] * ratio[1], bbox[3] * ratio[0]
+        ]).int()
+        # scaled_bbox = torch.tensor(bboxes_tointeger(scaled_bbox.unsqueeze(0), config.remove_bbox_intersection)[0])
+        output_size = (
+            int(scaled_bbox[3] - scaled_bbox[1]),
+            int(scaled_bbox[2] - scaled_bbox[0])
+        )
+        pooled = ops.roi_align(
+            output.unsqueeze(0).unsqueeze(0),
+            [scaled_bbox.unsqueeze(0).float().to(device)],
+            output_size=output_size, spatial_scale=1.0
+        )
+        pooled_vals.append(pooled)
 
     if config.ellipse_normalization:
-        output = ellipse_normalization(output)
+        norm_coeff = sum([(p[0, 0] * ellipse_coverage(p.shape[-2], p.shape[-1]).to(device)).sum() for p in pooled_vals]) / (len(pooled_vals) * config.scaling_coeff)
+    else:
+        norm_coeff = sum([p.sum() for p in pooled_vals]) / (len(pooled_vals) * config.scaling_coeff)
+    if config.fixed_norm_coeff is not None:
+        norm_coeff = config.fixed_norm_coeff
 
+    output = output / norm_coeff
+    # if config.filter_background is True:
+    thresh = max( [f.shape[-2] * f.shape[-1] for f in pooled_feats] )
+    thresh = (1 / thresh ) * 1.0
+    output[output < thresh] = 0
     return output
-
 
 def filter_background(density_map, pooled_features_list, config):
     """Filter out background noise from the density map."""
@@ -277,7 +262,7 @@ def parse_args():
                         help='Use ellipse kernel cleaning')
     parser.add_argument('--split', type=str, default='test',
                         help='Split to use')
-    parser.add_argument('--num_exemplars', type=int, default=3,
+    parser.add_argument('--num_exemplars', type=int, default=1,
                         help='Number of exemplars to use')
     parser.add_argument('--save_preds_to_file', action='store_true',
                         help='Save predictions to file')
@@ -344,9 +329,11 @@ def main():
             'box_examples_coordinates': annotations[img_filename]['box_examples_coordinates']
         }
 
-        _, pred = process_example(idx, img_filename, entry, model, transform, map_keys, args.img_dir, args)
+        # _, pred = process_example(idx, img_filename, entry, model, transform, map_keys, args.img_dir, args)
+        pred = process_example(idx, img_filename, entry, model, transform, map_keys,
+                            args.img_dir, args)
         gt = len(annotations[img_filename]['box_examples_coordinates'])
-
+        print('gt:',gt)
         # Calculate metrics
         mae = abs(pred - gt)
         mse = (pred - gt) ** 2

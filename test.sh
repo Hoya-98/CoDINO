@@ -6,10 +6,11 @@ RESIZE_DIM=840
 IMG_DIR="data/screws/images"
 ANNOTATION="data/screws/annotations/annotation.json"
 SPLITS="data/screws/annotations/test_split.json"
-
+CUSTOM="dinov2_vits14_merged.pth"
 # Run evaluation
 python convolutional_counting.py \
     --model_name $MODEL_NAME \
+    --custom_weights $CUSTOM \
     --resize_dim $RESIZE_DIM \
     --img_dir $IMG_DIR \
     --annotation $ANNOTATION \

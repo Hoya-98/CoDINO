@@ -5,6 +5,7 @@ from collections import OrderedDict
 import torchvision.transforms as T
 import torchvision
 import timm
+from peft import LoraConfig, PeftModel, get_peft_model
 
 class VisualBackbone(nn.Module):
     def __init__(self, model_name, img_size=384, custom_weights=None):
@@ -52,23 +53,36 @@ class VisualBackbone(nn.Module):
             self._setup_other_transformer_models()
 
     def _setup_dino_model(self):
-        if self.custom_weights:
-            # Load custom DINO model with LoRA weights
-            self.model = torch.load(self.custom_weights)
-            if hasattr(self.model, 'module'):
-                self.model = self.model.module
-            print(f"Loaded custom DINO model from {self.custom_weights}")
+        
+        base_model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14", pretrained=True)
+        student = get_peft_model(
+            base_model,
+            LoraConfig(
+                r=16,
+                lora_alpha=16 * 2,
+                lora_dropout=0.05,
+                target_modules=["qkv", "fc1", "fc2"],
+            ),
+        )
+        student.load_state_dict(torch.load(self.custom_weights))
+        # if self.custom_weights:
+        #     # Load custom DINO model with LoRA weights
             
-            # Ensure the model is in eval mode
-            self.model.eval()
+        #     self.model = torch.load(self.custom_weights)
+        #     if hasattr(self.model, 'module'):
+        #         self.model = self.model.module
+        #     print(f"Loaded custom DINO model from {self.custom_weights}")
             
-            # For DINOv2 ViT-S/14, ensure patch size is 14
-            if 'dinov2_vits14' in self.model_name:
-                assert self.model.patch_embed.patch_size[0] == 14, \
-                    f"Expected patch size 14 for DINOv2 ViT-S/14, got {self.model.patch_embed.patch_size[0]}"
-        else:
+        #     # Ensure the model is in eval mode
+        #     self.model.eval()
+            
+        #     # For DINOv2 ViT-S/14, ensure patch size is 14
+        #     if 'dinov2_vits14' in self.model_name:
+        #         assert self.model.patch_embed.patch_size[0] == 14, \
+        #             f"Expected patch size 14 for DINOv2 ViT-S/14, got {self.model.patch_embed.patch_size[0]}"
+        # else:
             # Load pretrained DINOv2 model
-            self.model = torch.hub.load('facebookresearch/dinov2', self.model_name)
+        # self.model = torch.hub.load('facebookresearch/dinov2', self.model_name)
         
         self.model.eval()
         self.patch_size = self.model.patch_embed.patch_size[0]
