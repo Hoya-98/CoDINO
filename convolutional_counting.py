@@ -38,6 +38,9 @@ from src.utils import (
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+# Define map_keys for DINOv2 model
+map_keys = ['vit_out']  # DINOv2 model outputs features with key 'vit_out'
+
 
 def process_example(
     idx, img_filename, entry, model, transform, map_keys, img_dir, config, return_maps=False

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 @dataclass
 class ModelConfig:
@@ -22,7 +22,6 @@ class DataConfig:
     img_dir: str = "data/screws/images"
     annotation_file: str = "data/screws/annotations/annotation.json"
     splits_file: str = "data/screws/annotations/test_split.json"
-    log_file: str = "results/screws_results.csv"
 
 @dataclass
 class Config:
@@ -31,6 +30,5 @@ class Config:
     data: DataConfig = DataConfig()
     
     def __post_init__(self):
-        # Validate resize_dim is multiple of 14
         if self.model.resize_dim % 14 != 0:
             raise ValueError(f"resize_dim must be multiple of 14, got {self.model.resize_dim}") 
