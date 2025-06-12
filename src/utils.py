@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from copy import deepcopy
 from PIL import ImageDraw, Image
 from sklearn.metrics import r2_score
+from typing import List, Tuple, Dict, Union
 
 
 
@@ -90,26 +91,15 @@ def draw_bounding_boxes(input_image, bounding_boxes, captions=[""], color="red",
     
     return image
 
-def convert_4corners_to_x1y1x2y2(bbox):
-    """
-    Convert a bounding box from [x1, y1, x2, y2] format to (x1, y1, x2, y2) format.
-    
-    Args:
-        bbox (list): A list of four coordinates [x1, y1, x2, y2]
-
-    Returns:
-        tuple: (x1, y1, x2, y2) where 
-               x1, y1 = top-left corner
-               x2, y2 = bottom-right corner
-    """
-    # If the input is already in the correct format, just return it
-    if len(bbox) == 4:
-        return bbox[0], bbox[1], bbox[2], bbox[3]
-    
-    # If the input is in the old format [[x1, y1], [x2, y2]]
-    x1, y1 = bbox[0]  # Top-left corner
-    x2, y2 = bbox[2]  # Bottom-right corner
-    return x1, y1, x2, y2
+def convert_4corners_to_x1y1x2y2(box: List[float]) -> Tuple[float, float, float, float]:
+    """Convert bounding box format."""
+    if len(box) == 4:
+        return tuple(box)  # Already in x1,y1,x2,y2 format
+    elif len(box) == 2 and len(box[0]) == 2 and len(box[1]) == 2:
+        # Convert from [[x1,y1], [x2,y2]] to [x1,y1,x2,y2]
+        return (box[0][0], box[0][1], box[1][0], box[1][1])
+    else:
+        raise ValueError(f"Invalid box format: {box}")
 
 def process_bboxes(imgs, bboxes, transform):
     transformed_bboxes = []
@@ -129,109 +119,30 @@ def process_bboxes(imgs, bboxes, transform):
     return torch.stack(transformed_bboxes)
 
 # Taken from https://github.com/Ruggero1912/Patch-ioner/blob/main/Patch-ioner/src/bbox_utils.py
-def extract_bboxes_feats(patch_embeddings, bboxes, gaussian_avg=False, 
-                         gaussian_bbox_variance=0.5, get_single_embedding_per_image=False,
-                         patch_size=14, attention_map=None):
-    """
-    if get_single_embedding_per_image is True, the weights of all the bounding boxes patches on an image will be summed and the function will return the patch weights depending on this map
-    """
-    N = patch_embeddings.shape[0]
-    N_boxes = bboxes.shape[1]
-    grid_size = int(patch_embeddings.shape[1]**0.5)
-    device = patch_embeddings.device
+def extract_bboxes_feats(features: torch.Tensor, boxes: List[List[float]]) -> torch.Tensor:
+    """Extract features for bounding boxes."""
+    pooled_feats = []
+    for box in boxes:
+        x1, y1, x2, y2 = convert_4corners_to_x1y1x2y2(box)
+        feat = features[:, y1:y2, x1:x2].mean(dim=(1, 2))
+        pooled_feats.append(feat)
+    return torch.stack(pooled_feats, dim=0)
 
-    bboxes //= patch_size
-    bboxes = bboxes.int()
+def compute_similarity_map(features: torch.Tensor, pooled_feats: torch.Tensor) -> torch.Tensor:
+    """Compute similarity map between features and pooled features."""
+    return torch.matmul(features, pooled_feats.t())
 
-    # Reshape patches to grid
-    patch_embeddings = patch_embeddings.view(N, grid_size, grid_size, -1)  # Shape (N, grid_size, grid_size, embed_dim)
-    if attention_map is not None:
-        attention_map = attention_map.view(N, grid_size, grid_size)  # Shape (N, grid_size, grid_size)
-    # Grid of the sum of the gaussian weights
-    total_patch_weights = torch.zeros(N, grid_size, grid_size)
+def create_density_map(similarity_map: torch.Tensor) -> torch.Tensor:
+    """Create density map from similarity map."""
+    return torch.sum(similarity_map, dim=-1)
 
-    # Extract boxes
-    x1, y1, w, h = bboxes.unbind(-1)  # Separate box dimensions (N, N_boxes)
+def normalize_density_map(density_map: torch.Tensor) -> torch.Tensor:
+    """Normalize density map to [0,1] range."""
+    return (density_map - density_map.min()) / (density_map.max() - density_map.min())
 
-    # Create mesh grid for slicing
-    x2 = x1 + w  # Exclusive end x
-    y2 = y1 + h  # Exclusive end y
-
-    means = []
-    for i in range(N):
-        image_means = []
-        for j in range(N_boxes):
-            # if bboxes[i, j].sum().item() < 0:
-            #     # this is the case where we receive a dummy box
-            #     continue
-            # Extract the region for each box
-            region_patches = patch_embeddings[i, y1[i, j]:y2[i, j] + 1, x1[i, j]:x2[i, j] + 1, :]  # (h, w, embed_dim)
-            
-            if attention_map is not None:
-                patch_weights = attention_map[i, y1[i, j]:y2[i, j] + 1, x1[i, j]:x2[i, j] + 1]
-                patch_weights /= patch_weights.sum()
-                total_patch_weights[i, y1[i, j]:y2[i, j] + 1, x1[i, j]:x2[i, j] + 1] += patch_weights
-                
-                weighted_patches = region_patches * patch_weights.to(device).unsqueeze(-1)  # (h, w, embed_dim)
-                region_mean = weighted_patches.sum(dim=(0, 1))  # Weighted mean
-                
-            elif gaussian_avg:
-                # Create Gaussian weights
-                h_span, w_span = region_patches.shape[:2]
-                y_coords, x_coords = torch.meshgrid(
-                    torch.linspace(-1, 1, h_span),
-                    torch.linspace(-1, 1, w_span),
-                    indexing="ij"
-                )
-                if gaussian_bbox_variance == 0:
-                    patch_weights = torch.zeros((h_span, w_span))
-                    # Determine central indices
-                    center_y = [h_span // 2] if h_span % 2 == 1 else [h_span // 2 - 1, h_span // 2]
-                    center_x = [w_span // 2] if w_span % 2 == 1 else [w_span // 2 - 1, w_span // 2]
-                    # Randomly select one of the central elements in even case
-                    center_y = random.choice(center_y)
-                    center_x = random.choice(center_x)
-                    # Set the selected central element to 1
-                    patch_weights[center_y, center_x] = 1.0
-                else:
-                    distances = x_coords**2 + y_coords**2
-                    patch_weights = torch.exp(-distances / gaussian_bbox_variance)
-                    patch_weights = patch_weights / patch_weights.sum()  # Normalize to sum to 1
-
-                # Apply Gaussian weights to region patches
-                weighted_patches = region_patches * patch_weights.to(device).unsqueeze(-1)  # (h, w, embed_dim)
-                region_mean = weighted_patches.sum(dim=(0, 1))  # Weighted mean
-                
-                # Recording the bbox weight inside the image patch weight map
-                total_patch_weights[i, y1[i, j]:y2[i, j] + 1, x1[i, j]:x2[i, j] + 1] += patch_weights
-            else:
-                # Mean pooling case: create uniform weights
-                h_span, w_span = region_patches.shape[:2]
-                uniform_weights = torch.ones(h_span, w_span) / (h_span * w_span)
-                
-                # Update total_patch_weights for mean pooling
-                total_patch_weights[i, y1[i,j]:y2[i,j]+1, x1[i,j]:x2[i,j]+1] += uniform_weights
-                
-                # Compute mean of the region
-                region_mean = region_patches.mean(dim=(0, 1))
-
-            # Store the mean
-            image_means.append(region_mean)
-        if not get_single_embedding_per_image:
-            means.append(torch.stack(image_means))
-
-    # Normalizing the weight map so the sum is equal to 1
-    total_patch_weights /= total_patch_weights.sum(dim=(1,2), keepdim=True)
-    if not get_single_embedding_per_image:
-        return torch.stack(means)  # Shape (N, N_boxes, embed_dim)
-    else:
-        # Expand dimensions to match embeddings
-        total_patch_weights = total_patch_weights.unsqueeze(-1).to(device)
-
-        # Compute weighted sum
-        weighted_patch_mean = (total_patch_weights * patch_embeddings).sum(dim=(1, 2))  
-        return  weighted_patch_mean 
-    
+def threshold_density_map(density_map: torch.Tensor, threshold: float) -> torch.Tensor:
+    """Apply threshold to density map."""
+    return (density_map > threshold).float()
 
 def get_counting_metrics(predictions, targets, compute_madiff=False):
     # Convert to numpy arrays for calculations
@@ -572,4 +483,40 @@ def delete_row(idx, path='results/results.csv'):
     df = pd.read_csv(path)
     df = df.drop(idx)
     df.to_csv(path, index=False)
+    
+# Image Processing Utilities
+def load_image(image_path: str) -> Image.Image:
+    """Load and validate image."""
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    return Image.open(image_path)
+
+# Data Loading Utilities
+def load_annotations(annotation_file: str) -> Dict:
+    """Load and validate annotations."""
+    with open(annotation_file, 'r') as f:
+        annotations = json.load(f)
+    return annotations
+
+def load_splits(splits_file: str) -> Dict:
+    """Load and validate splits."""
+    with open(splits_file, 'r') as f:
+        splits = json.load(f)
+    return splits
+
+# Evaluation Utilities
+def compute_metrics(predicted_count: int, ground_truth_count: int) -> Dict[str, float]:
+    """Compute evaluation metrics."""
+    mae = abs(predicted_count - ground_truth_count)
+    mse = (predicted_count - ground_truth_count) ** 2
+    return {
+        'mae': mae,
+        'mse': mse,
+        'rmse': np.sqrt(mse)
+    }
+
+def save_results(results: List[Dict], output_file: str):
+    """Save evaluation results."""
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
     

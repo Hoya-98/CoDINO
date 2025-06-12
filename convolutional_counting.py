@@ -14,6 +14,8 @@ import numpy as np
 import re
 import timm
 import pandas as pd
+import math
+from datetime import datetime
 
 from src.model import VisualBackbone
 from src.utils import (
@@ -224,86 +226,173 @@ def ellipse_normalization(density_map):
     return density_map * ellipse
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="dinov2_vits14_reg")
-    parser.add_argument("--img_dir", type=str, required=True)
-    parser.add_argument("--annotation", type=str, required=True)
-    parser.add_argument("--splits", type=str, required=True)
-    parser.add_argument("--log_file", type=str, default="results.csv")
-    parser.add_argument("--divide_et_impera", action="store_true")
-    parser.add_argument("--divide_et_impera_twice", action="store_true")
-    parser.add_argument("--exemplar_avg", action="store_true")
-    parser.add_argument("--cosine_similarity", action="store_true")
-    parser.add_argument("--normalize_features", action="store_true")
-    parser.add_argument("--normalize_only_biggest_bbox", action="store_true")
-    parser.add_argument("--use_threshold", action="store_true")
-    parser.add_argument("--use_roi_norm", action="store_true")
-    parser.add_argument("--roi_norm_after_mean", action="store_true")
-    parser.add_argument("--use_minmax_norm", action="store_true")
-    parser.add_argument("--remove_bbox_intersection", action="store_true")
-    parser.add_argument("--correct_bbox_resize", action="store_true")
-    parser.add_argument("--scaling_coeff", type=float, default=1.0)
-    parser.add_argument("--fixed_norm_coeff", type=float, default=None)
-    parser.add_argument("--filter_background", action="store_true")
-    parser.add_argument("--ellipse_normalization", action="store_true")
-    parser.add_argument("--ellipse_kernel_cleaning", action="store_true")
-    parser.add_argument("--split", type=str, default="test")
-    parser.add_argument("--num_exemplars", type=int, default=None)
-    parser.add_argument("--save_preds_to_file", action="store_true")
-    parser.add_argument("--log_results", action="store_true")
-    parser.add_argument("--no_skip", action="store_true")
-    parser.add_argument("--resize_dim", type=int, default=840)
-    args = parser.parse_args()
+def parse_args():
+    parser = argparse.ArgumentParser(description='Convolutional Counting')
+    parser.add_argument('--model_name', type=str, default='dinov2_vits14_reg',
+                        help='Name of the model to use')
+    parser.add_argument('--custom_weights', type=str, default=None,
+                        help='Path to custom model weights (e.g., LoRA fine-tuned model)')
+    parser.add_argument('--img_dir', type=str, required=True,
+                        help='Directory containing images')
+    parser.add_argument('--annotation', type=str, required=True,
+                        help='Path to annotation file')
+    parser.add_argument('--splits', type=str, required=True,
+                        help='Path to splits file')
+    parser.add_argument('--divide_et_impera', action='store_true',
+                        help='Use divide et impera strategy')
+    parser.add_argument('--divide_et_impera_twice', action='store_true',
+                        help='Use divide et impera strategy twice')
+    parser.add_argument('--exemplar_avg', action='store_true',
+                        help='Average exemplar features')
+    parser.add_argument('--cosine_similarity', action='store_true',
+                        help='Use cosine similarity')
+    parser.add_argument('--normalize_features', action='store_true',
+                        help='Normalize features')
+    parser.add_argument('--normalize_only_biggest_bbox', action='store_true',
+                        help='Normalize only the biggest bounding box')
+    parser.add_argument('--use_threshold', action='store_true',
+                        help='Use threshold for counting')
+    parser.add_argument('--use_roi_norm', action='store_true',
+                        help='Use ROI normalization')
+    parser.add_argument('--roi_norm_after_mean', action='store_true',
+                        help='Apply ROI normalization after mean')
+    parser.add_argument('--use_minmax_norm', action='store_true',
+                        help='Use min-max normalization')
+    parser.add_argument('--remove_bbox_intersection', action='store_true',
+                        help='Remove bounding box intersections')
+    parser.add_argument('--correct_bbox_resize', action='store_true',
+                        help='Correct bounding box resize')
+    parser.add_argument('--scaling_coeff', type=float, default=1.0,
+                        help='Scaling coefficient')
+    parser.add_argument('--fixed_norm_coeff', type=float, default=None,
+                        help='Fixed normalization coefficient')
+    parser.add_argument('--filter_background', action='store_true',
+                        help='Filter background')
+    parser.add_argument('--ellipse_normalization', action='store_true',
+                        help='Use ellipse normalization')
+    parser.add_argument('--ellipse_kernel_cleaning', action='store_true',
+                        help='Use ellipse kernel cleaning')
+    parser.add_argument('--split', type=str, default='test',
+                        help='Split to use')
+    parser.add_argument('--num_exemplars', type=int, default=3,
+                        help='Number of exemplars to use')
+    parser.add_argument('--save_preds_to_file', action='store_true',
+                        help='Save predictions to file')
+    parser.add_argument('--log_results', action='store_true',
+                        help='Log results')
+    parser.add_argument('--no_skip', action='store_true',
+                        help='Do not skip any images')
+    parser.add_argument('--resize_dim', type=int, default=840,
+                        help='Resize dimension')
+    parser.add_argument('--log_file', type=str, default='results/results.json',
+                        help='Path to save results')
+    parser.add_argument('--experiment_name', type=str, default=None,
+                        help='Name of the experiment for tracking')
+    return parser.parse_args()
 
+
+def main():
+    args = parse_args()
     print("Parameters Recap:")
     print(json.dumps(vars(args), indent=2))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load model
-    model = VisualBackbone(args.model_name, img_size=args.resize_dim).to(device).eval()
-    transform = T.Compose([
-        T.Resize((args.resize_dim, args.resize_dim)),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    # Create experiment directory
+    if args.experiment_name:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        experiment_dir = os.path.join("results", f"{args.experiment_name}_{timestamp}")
+        os.makedirs(experiment_dir, exist_ok=True)
+        args.log_file = os.path.join(experiment_dir, "results.json")
+        
+        # Save configuration
+        with open(os.path.join(experiment_dir, "config.json"), 'w') as f:
+            json.dump(vars(args), f, indent=2)
 
-    # Load annotations
+    # Load model
+    model = VisualBackbone(
+        args.model_name, 
+        img_size=args.resize_dim,
+        custom_weights=args.custom_weights
+    ).to(device).eval()
+
+    # Use model's transform
+    transform = model.get_transform()
+
+    # Load annotations and splits
     with open(args.annotation, 'r') as f:
         annotations = json.load(f)
     with open(args.splits, 'r') as f:
         splits = json.load(f)
 
-    # Get image filenames for the specified split
-    img_filenames = splits[args.split]
-
-    # Initialize results
+    # Process images
     results = []
-    map_keys = ['vit_out']  # Changed from ['layer11'] to ['vit_out'] for DINOv2
+    total_mae = 0
+    total_mse = 0
+    count = 0
 
-    # Process each image
-    for idx, img_filename in enumerate(tqdm(img_filenames)):
-        # Get annotation for this image
+    for idx, img_filename in enumerate(tqdm(splits[args.split])):
         if img_filename not in annotations:
-            print(f"Warning: No annotation found for {img_filename}")
             continue
 
         entry = {
             'filename': img_filename,
             'box_examples_coordinates': annotations[img_filename]['box_examples_coordinates']
         }
-        
-        # Process the image
+
         _, pred = process_example(idx, img_filename, entry, model, transform, map_keys, args.img_dir, args)
-        results.append(pred)
+        gt = len(annotations[img_filename]['box_examples_coordinates'])
+
+        # Calculate metrics
+        mae = abs(pred - gt)
+        mse = (pred - gt) ** 2
+        total_mae += mae
+        total_mse += mse
+        count += 1
+
+        # Store detailed results
+        result = {
+            'filename': img_filename,
+            'predicted_count': float(pred),
+            'ground_truth': gt,
+            'mae': float(mae),
+            'mse': float(mse),
+            'exemplar_boxes': entry['box_examples_coordinates']
+        }
+        results.append(result)
+
+    # Calculate final metrics
+    final_mae = total_mae / count
+    final_mse = total_mse / count
+    final_rmse = math.sqrt(final_mse)
+
+    # Create summary
+    summary = {
+        'model_name': args.model_name,
+        'dataset': 'screws',
+        'split': args.split,
+        'total_images': count,
+        'final_metrics': {
+            'mae': float(final_mae),
+            'mse': float(final_mse),
+            'rmse': float(final_rmse)
+        },
+        'parameters': vars(args),
+        'results': results
+    }
 
     # Save results
-    if args.log_results:
-        os.makedirs(os.path.dirname(args.log_file), exist_ok=True)
-        with open(args.log_file, 'w') as f:
-            json.dump(results, f, indent=2)
+    os.makedirs(os.path.dirname(args.log_file), exist_ok=True)
+    with open(args.log_file, 'w') as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"\nEvaluation completed:")
+    print(f"Total images processed: {count}")
+    print(f"MAE: {final_mae:.2f}")
+    print(f"MSE: {final_mse:.2f}")
+    print(f"RMSE: {final_rmse:.2f}")
+    print(f"Results saved to: {args.log_file}")
 
 if __name__ == "__main__":
     main()
